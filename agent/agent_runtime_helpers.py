@@ -2757,37 +2757,46 @@ def _repair_invalid_tool_call_names(messages: List[Dict[str, Any]]) -> None:
     fallback model put in ``name``) is coerced deterministically, because one such stored turn 400s
     every later request on a strict endpoint and pins the session to the fallback model (#51944).
     Tool calls are rewritten copy-on-write (an SDK object becomes a dict copy) so a shallow per-call
-    copy never edits persisted history; tool results follow via ``_realign_tool_result_names``."""
+    copy never edits persisted history; tool results follow via ``_realign_tool_result_names``.
+    
+    Retry limit: Prevents infinite loops by limiting repairs to 5 attempts per tool call."""
+    MAX_REPAIRS_PER_TOOL_CALL = 5
     for msg in messages:
         if msg.get("role") != "assistant":
             continue
         tcs = msg.get("tool_calls") or []
         for idx, tc in enumerate(tcs):
-            if isinstance(tc, dict):
-                fn = tc.get("function")
-                name = fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", None)
-            else:
-                fn = getattr(tc, "function", None)
-                name = getattr(fn, "name", None) if fn else None
-            coerced = coerce_tool_name(name)
-            if coerced == name:
-                continue
-            _ra().logger.warning(
-                "Pre-call sanitizer: repairing tool_call with invalid function.name %r -> %r (id=%s)",
-                (name or "")[:80], coerced, _ra().AIAgent._get_tool_call_id_static(tc),
-            )
-            if tcs is msg.get("tool_calls"):
-                tcs = msg["tool_calls"] = list(tcs)
-            if isinstance(tc, dict):
-                fn = {**fn, "name": coerced} if isinstance(fn, dict) else {"name": coerced, "arguments": "{}"}
-                tcs[idx] = {**tc, "function": fn}
-            else:
-                args = getattr(fn, "arguments", None) if fn is not None else None
-                tcs[idx] = {
-                    "id": _ra().AIAgent._get_tool_call_id_static(tc),
-                    "type": "function",
-                    "function": {"name": coerced, "arguments": args if isinstance(args, str) else "{}"},
-                }
+            repair_count = 0
+            while repair_count < MAX_REPAIRS_PER_TOOL_CALL:
+                if isinstance(tc, dict):
+                    fn = tc.get("function")
+                    name = fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", None)
+                else:
+                    fn = getattr(tc, "function", None)
+                    name = getattr(fn, "name", None) if fn else None
+                coerced = coerce_tool_name(name)
+                if coerced == name:
+                    break
+                _ra().logger.warning(
+                    "Pre-call sanitizer: repairing tool_call with invalid function.name %r -> %r (id=%s, attempt %d)",
+                    (name or "")[:80], coerced, _ra().AIAgent._get_tool_call_id_static(tc), repair_count + 1,
+                )
+                if tcs is msg.get("tool_calls"):
+                    tcs = msg["tool_calls"] = list(tcs)
+                if isinstance(tc, dict):
+                    fn = {**fn, "name": coerced} if isinstance(fn, dict) else {"name": coerced, "arguments": "{}"}
+                    tcs[idx] = {**tc, "function": fn}
+                else:
+                    args = getattr(fn, "arguments", None) if fn is not None else None
+                    tcs[idx] = {
+                        "id": _ra().AIAgent._get_tool_call_id_static(tc),
+                        "type": "function",
+                        "function": {"name": coerced, "arguments": args if isinstance(args, str) else "{}"},
+                    }
+                repair_count += 1
+                if repair_count >= MAX_REPAIRS_PER_TOOL_CALL:
+                    _ra().logger.error("Pre-call sanitizer: exceeded repair limit for tool_call %s", _ra().AIAgent._get_tool_call_id_static(tc))
+                    break
 
 
 def _drop_results_without_ids(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
