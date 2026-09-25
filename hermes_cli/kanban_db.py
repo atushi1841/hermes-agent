@@ -45,15 +45,42 @@ def validate_skill_for_profile(skill_name: str, profile: str) -> bool:
     return get_profile_skill_path(profile, skill_name) is not None
 
 
-def clear_invalid_skills_for_assignee(task_id: str, assignee: str) -> list[str]:
+def clear_invalid_skills_for_assignee(conn: sqlite3.Connection, task_id: str, assignee: str) -> list[str]:
     """Remove skills from a task that don't exist in the assignee's profile.
 
     Returns list of removed skill names.
     """
-    # This function is a stub; actual DB update should be done by caller.
-    # For now, we just validate and return what would be removed.
-    # Implementation will be added in assign_task and create_task hooks.
-    return []
+    # Fetch current skills of the task
+    row = conn.execute("SELECT skills FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if not row or not row["skills"]:
+        return []
+    try:
+        current_skills = json.loads(row["skills"])
+    except (json.JSONDecodeError, TypeError):
+        current_skills = []
+    if not current_skills:
+        return []
+    
+    # Determine valid skills for the assignee
+    valid_skills = []
+    for skill in current_skills:
+        if validate_skill_for_profile(skill, assignee):
+            valid_skills.append(skill)
+    
+    # If all skills are valid, nothing to remove
+    if set(valid_skills) == set(current_skills):
+        return []
+    
+    # Update task with only valid skills
+    new_skills_json = json.dumps(valid_skills) if valid_skills else None
+    conn.execute(
+        "UPDATE tasks SET skills = ? WHERE id = ?",
+        (new_skills_json, task_id),
+    )
+    
+    # Return removed skills
+    removed = [s for s in current_skills if s not in valid_skills]
+    return removed
 
 
 _log = logging.getLogger(__name__)
