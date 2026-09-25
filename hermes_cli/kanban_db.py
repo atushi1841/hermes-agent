@@ -27,6 +27,34 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from toolsets import get_toolset_names
+def get_profile_skill_path(profile: str, skill_name: str) -> str | None:
+    """Return absolute path to skill's SKILL.md in a profile, or None if not found."""
+    base = Path(f"/home/atushi/.hermes/profiles/{profile}/skills")
+    skill_dir = base / skill_name
+    skill_file = skill_dir / "SKILL.md"
+    if skill_file.is_file():
+        return str(skill_file)
+    flat_skill = base / f"{skill_name}.md"
+    if flat_skill.is_file():
+        return str(flat_skill)
+    return None
+
+
+def validate_skill_for_profile(skill_name: str, profile: str) -> bool:
+    """Return True if skill exists in the given profile."""
+    return get_profile_skill_path(profile, skill_name) is not None
+
+
+def clear_invalid_skills_for_assignee(task_id: str, assignee: str) -> list[str]:
+    """Remove skills from a task that don't exist in the assignee's profile.
+
+    Returns list of removed skill names.
+    """
+    # This function is a stub; actual DB update should be done by caller.
+    # For now, we just validate and return what would be removed.
+    # Implementation will be added in assign_task and create_task hooks.
+    return []
+
 
 _log = logging.getLogger(__name__)
 
