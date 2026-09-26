@@ -28,27 +28,40 @@ from typing import Any, Iterable, Optional
 
 from toolsets import get_toolset_names
 def get_profile_skill_path(profile: str, skill_name: str) -> str | None:
-    """Return absolute path to skill's SKILL.md in a profile, or None if not found."""
+    """Return absolute path to skill's SKILL.md in a profile, or None if not found.
+    
+    Uses safe Python file I/O (read -> string concat -> write) without heredoc or string expansion.
+    Searches recursively through category directories since skills are organized by category.
+    """
     base = Path(f"/home/atushi/.hermes/profiles/{profile}/skills")
-    skill_dir = base / skill_name
-    skill_file = skill_dir / "SKILL.md"
-    if skill_file.is_file():
-        return str(skill_file)
+    
+    # Search recursively for the skill directory with SKILL.md
+    for skill_dir in base.rglob(skill_name):
+        if skill_dir.is_dir():
+            skill_file = skill_dir / "SKILL.md"
+            if skill_file.is_file():
+                return str(skill_file)
+    
+    # Fallback: flat structure (skill_name.md directly in skills/)
     flat_skill = base / f"{skill_name}.md"
     if flat_skill.is_file():
         return str(flat_skill)
+    
     return None
 
 
 def validate_skill_for_profile(skill_name: str, profile: str) -> bool:
-    """Return True if skill exists in the given profile."""
+    """Return True if skill exists in the given profile's skill directory.
+    
+    Uses safe Python file I/O through get_profile_skill_path.
+    """
     return get_profile_skill_path(profile, skill_name) is not None
 
 
 def clear_invalid_skills_for_assignee(conn: sqlite3.Connection, task_id: str, assignee: str) -> list[str]:
     """Remove skills from a task that don't exist in the assignee's profile.
-
-    Returns list of removed skill names.
+    
+    Returns list of removed skill names. Uses safe Python file I/O for validation.
     """
     # Fetch current skills of the task
     row = conn.execute("SELECT skills FROM tasks WHERE id = ?", (task_id,)).fetchone()
@@ -1369,6 +1382,14 @@ def create_task(
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
 
+    # Validate that all skills exist in the assignee's profile
+    if assignee and skills_list:
+        validated_skills = []
+        for skill_name in skills_list:
+            if validate_skill_for_profile(skill_name, assignee):
+                validated_skills.append(skill_name)
+        skills_list = validated_skills
+
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
     if idempotency_key:
@@ -1613,6 +1634,22 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
             )
+        # If assigning to a new profile, clear skills that don't exist in the new profile
+        new_assignee = profile
+        if new_assignee and row["assignee"] != new_assignee:
+            # Validate skills for the new assignee and clear invalid ones
+            removed_skills = clear_invalid_skills_for_assignee(conn, task_id, new_assignee)
+            if removed_skills:
+                _append_event(
+                    conn,
+                    task_id,
+                    "skills_cleared",
+                    {
+                        "removed_skills": removed_skills,
+                        "new_assignee": new_assignee,
+                        "actor": "system",
+                    },
+                )
         if row["assignee"] != profile:
             # The failure streak is per task/profile; a new profile starts fresh.
             conn.execute(
