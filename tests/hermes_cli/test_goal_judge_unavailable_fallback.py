@@ -191,6 +191,11 @@ def test_judge_failure_ceiling_reads_config(monkeypatch):
 # ---------------------------------------------------------------------------
 # 2. Completion gate fails OPEN when the judge is unreachable
 # ---------------------------------------------------------------------------
+# NOTE on the return contract: both ``_goal_mode_handoff_rejection`` implementations return
+# ``(verdict, reason_or_None)`` — NOT a bare reason/None. ``("done", None)`` = allow,
+# ``("continue", reason)`` = reject, ``("blocked", reason)`` = judged unachievable. The tuple is
+# pinned by tests/hermes_cli/test_kanban_goal_judge_affinity.py (upstream) and is what
+# ``_goal_gate_error`` / ``_goal_gate`` need to pick the right guidance per verdict.
 
 
 def _gate_task():
@@ -214,7 +219,7 @@ def test_cli_gate_allows_handoff_when_judge_unreachable(monkeypatch):
         lambda **kw: ("continue", "judge error: BadRequestError", False, None, True),
     )
 
-    assert kb_cli._goal_mode_handoff_rejection(_gate_task(), "evidence") is None
+    assert kb_cli._goal_mode_handoff_rejection(_gate_task(), "evidence") == ("done", None)
 
 
 def test_cli_gate_still_rejects_a_real_not_done_verdict(monkeypatch):
@@ -229,9 +234,8 @@ def test_cli_gate_still_rejects_a_real_not_done_verdict(monkeypatch):
         lambda **kw: ("continue", "criteria not met", False, None, False),
     )
 
-    assert (
-        kb_cli._goal_mode_handoff_rejection(_gate_task(), "evidence")
-        == "criteria not met"
+    assert kb_cli._goal_mode_handoff_rejection(_gate_task(), "evidence") == (
+        "continue", "criteria not met"
     )
 
 
@@ -244,7 +248,7 @@ def test_tool_gate_allows_handoff_when_judge_unreachable(monkeypatch):
         lambda **kw: ("continue", "judge error: TimeoutError", False, None, True),
     )
 
-    assert kanban_tools._goal_mode_handoff_rejection(_gate_task(), "evidence") is None
+    assert kanban_tools._goal_mode_handoff_rejection(_gate_task(), "evidence") == ("done", None)
 
 
 def test_tool_gate_still_rejects_a_real_not_done_verdict(monkeypatch):
@@ -256,10 +260,12 @@ def test_tool_gate_still_rejects_a_real_not_done_verdict(monkeypatch):
         lambda **kw: ("continue", "criteria not met", False, None, False),
     )
 
-    assert (
-        kanban_tools._goal_mode_handoff_rejection(_gate_task(), "evidence")
-        == "criteria not met"
+    assert kanban_tools._goal_mode_handoff_rejection(_gate_task(), "evidence") == (
+        "continue", "criteria not met"
     )
+    # ...and the gate itself still turns that real verdict into a rejection.
+    with pytest.raises(kanban_tools._Reject):
+        kanban_tools._goal_gate("kanban_complete", _gate_task(), "task-1", "ev")
 
 
 # ---------------------------------------------------------------------------

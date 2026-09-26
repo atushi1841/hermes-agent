@@ -44,6 +44,12 @@ DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
 # Consecutive transport failures (401, timeout, DNS) before auto-pause: a broken API key returns
 # 401 every call and must not spend every turn on an unreachable judge.
 DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
+# ``run_kanban_goal_loop`` (the kanban goal-mode worker loop) ceiling: after this many
+# CONSECUTIVE unusable judge verdicts — transport errors (the bai-dead HTTP400 BadRequestError
+# case, t_fa046d3a) OR unparseable output — the loop blocks the card instead of re-poking the
+# worker until the turn budget drains (that stall sat a card ready/running ~34.5h).
+# Override via ``goals.max_consecutive_judge_failures`` in config.yaml.
+DEFAULT_MAX_CONSECUTIVE_JUDGE_FAILURES = 3
 
 # Quality gates: deterministic shell commands that must pass before the judge may declare DONE. A
 # failed gate short-circuits the judge — its output IS the continuation prompt, so the agent works
@@ -747,6 +753,25 @@ def _goal_judge_max_tokens() -> int:
 
 def _goal_judge_timeout() -> float:
     return _goal_judge_setting("timeout", DEFAULT_JUDGE_TIMEOUT, float)
+
+
+def _goal_judge_failure_ceiling() -> int:
+    """``goals.max_consecutive_judge_failures`` from config.yaml, else the default.
+
+    The kanban goal-mode loop reads this before judging, so an operator can tighten/loosen how
+    many unusable judge verdicts in a row it tolerates without a code change. Garbage or a
+    non-positive value falls back to ``DEFAULT_MAX_CONSECUTIVE_JUDGE_FAILURES``.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        raw = (load_config().get("goals") or {}).get("max_consecutive_judge_failures")
+        value = int(raw)
+        if value > 0:
+            return value
+    except Exception:
+        pass
+    return DEFAULT_MAX_CONSECUTIVE_JUDGE_FAILURES
 
 
 def _extract_json_object(raw: str) -> Optional[Dict[str, Any]]:
@@ -1601,6 +1626,7 @@ def run_kanban_goal_loop(
     task_status_fn,
     block_fn,
     max_turns: int = DEFAULT_MAX_TURNS,
+    max_judge_failures: Optional[int] = None,
     first_response: str = "",
     log=None,
 ) -> Dict[str, Any]:
@@ -1610,6 +1636,12 @@ def run_kanban_goal_loop(
     ``kanban_block`` / review hand-off); otherwise judge the latest response against ``goal_text``
     (the card's title + body) and feed a continuation or finalize nudge. A WAIT verdict is treated
     as CONTINUE (workers finish via kanban tools, not by parking).
+
+    Judge unavailability must never wedge the loop: ``judge_goal`` fails OPEN to ``continue`` with
+    ``parse_failed`` / ``transport_failed`` set (HTTP400 from a dead provider, a model that won't
+    emit JSON). Counting those as "not done yet" re-pokes the worker forever, so after
+    ``max_judge_failures`` CONSECUTIVE unusable verdicts the loop blocks the card and stops —
+    outcome ``blocked_judge_unavailable``. A single usable verdict resets the streak.
     """
 
     def _log(msg: str) -> None:
@@ -1631,10 +1663,14 @@ def run_kanban_goal_loop(
     max_turns = int(max_turns or DEFAULT_MAX_TURNS)
     if max_turns < 1:
         max_turns = DEFAULT_MAX_TURNS
+    # Unusable-verdict ceiling: explicit arg wins, else goals.max_consecutive_judge_failures.
+    ceiling = int(max_judge_failures) if (max_judge_failures and int(max_judge_failures) > 0) \
+        else _goal_judge_failure_ceiling()
 
     last_response = first_response or ""
     turns_used = 1   # the first turn already consumed one unit of budget
     nudged_to_finalize = False
+    judge_failures = 0   # consecutive unusable (transport/parse-failed) verdicts
 
     while True:
         try:
@@ -1665,6 +1701,26 @@ def run_kanban_goal_loop(
         if verdict == "wait":
             verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
+
+        # An unusable verdict (judge API unreachable, or output that isn't the required JSON) is
+        # NOT a human "not done yet": `judge_goal` fails OPEN to `continue` with these flags set.
+        # Re-poking the worker on every such verdict drains the whole turn budget — that is exactly
+        # how t_fa046d3a sat ready/running ~34.5h on a dead judge provider (HTTP400 BadRequestError).
+        # So count the streak and cut the loop at the ceiling; any usable verdict resets it.
+        if _parse_failed or _transport_failed:
+            judge_failures += 1
+            if judge_failures >= ceiling:
+                cause = "unparseable output" if _parse_failed else "API/transport error"
+                detail = f"judge unusable {judge_failures}x in a row ({cause}): {_truncate(reason, 200)}"
+                _log(f"kanban goal loop: task {task_id} {detail}; blocking instead of burning the budget")
+                _block(
+                    f"Goal-mode loop stopped: the goal judge is unusable — {detail}. The card is "
+                    f"blocked rather than left ready/running. Fix auxiliary.goal_judge "
+                    f"(provider/model/key) in config.yaml, then release the card."
+                )
+                return _result("blocked_judge_unavailable", detail)
+        else:
+            judge_failures = 0
 
         if verdict == "blocked":
             # Unachievable is NOT done: block the card with the judge's reason now instead of

@@ -1333,6 +1333,14 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     return sweep.crashed
 
 
+# A card in one of these states is finished from the board's point of view (same pair the
+# retention sweep treats as done: ``status IN ('done', 'archived')``). A failure reported against
+# one is always LATE — the worker completed first and its own process reported afterwards
+# (t_0b949bda: `completed` 33s before a phantom `timed_out`). Recording it would bump
+# ``consecutive_failures``, append a bogus event and, on a trip, try to flip a finished card back.
+_FINISHED_CARD_STATUSES = frozenset({"done", "archived"})
+
+
 def _record_task_failure(
     conn: sqlite3.Connection,
     task_id: str,
@@ -1373,6 +1381,10 @@ def _record_task_failure(
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
+            return False
+        if str(row["status"]) in _FINISHED_CARD_STATUSES:
+            # Late report against an already-finished card: record NOTHING (no counter bump,
+            # no event, no run write) so a completed card can never collect a phantom failure.
             return False
         retry_status = (
             _kb._retry_status_for_run(conn, task_id, row["current_run_id"])

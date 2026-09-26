@@ -458,20 +458,27 @@ _GOAL_GATE_MESSAGES = {
             "matching the card before requesting review.")}}
 
 
-def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
-    """Goal-mode pre-handoff judge gate: a worker must not complete / request
-    review before acceptance criteria are met. ``blocked`` gets its own
-    guidance; any other non-``done`` verdict gets the ``continue`` guidance.
-    A broken judge fails open (logged) so it cannot permanently wedge work."""
+def _goal_mode_handoff_rejection(task, evidence: str):
+    """``(verdict, reason_or_None)`` for a goal-mode terminal handoff (tools side).
+
+    ``("done", None)`` allows the handoff; ``("blocked", reason)`` = the judge ruled the goal
+    unachievable; ``("continue", reason)`` = criteria not met yet. Judge *failures* — unreachable
+    provider (HTTP400 from a dead aux lane), relay rejection, timeout — allow the handoff and are
+    only logged: an unreachable judge is not a human "not done" (#83610), and the whole point of
+    this split is that a dead judge can no longer wedge a goal_mode card (t_fa046d3a).
+
+    Mirrors ``hermes_cli.kanban._goal_mode_handoff_rejection`` so the CLI and the worker tool
+    gates reject for exactly the same reasons.
+    """
     if not task or not task.goal_mode or not _goal_judge_available():
-        return
+        return ("done", None)
     try:
         # Headless gate runs outside any agent turn: bind the per-task relay-affinity scope
         # (mirrors kanban_specify) so the relay does not reject the judge call (#113669).
         from agent.portal_tags import get_affinity_scope, reset_affinity_scope, set_affinity_scope
-        affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{tid}")
+        affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{task.id}")
         try:
-            verdict, reason, _, _, transport_failed = judge_goal(
+            verdict, reason, _parse_failed, _wait, transport_failed = judge_goal(
                 goal=f"{task.title}\n\n{task.body or ''}".strip(), last_response=evidence.strip())
         finally:
             if affinity_token is not None:
@@ -479,12 +486,21 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
     except Exception as judge_exc:
         logger.warning(
             "goal judge check failed, allowing lifecycle handoff: %s", judge_exc, exc_info=True)
-        return
+        return ("done", None)
     if transport_failed:
-        # ``judge_goal`` fails open to ``continue`` on transport errors (relay 400, auth, timeout);
-        # an unreachable judge is not a human "not done" and must not reject the handoff (#83610).
         logger.warning("goal judge unreachable (%s), allowing lifecycle handoff", reason)
-        return
+        return ("done", None)
+    if verdict in ("done", "wait"):
+        return ("done", None)
+    return (verdict, reason)
+
+
+def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
+    """Goal-mode pre-handoff judge gate: a worker must not complete / request
+    review before acceptance criteria are met. ``blocked`` gets its own
+    guidance; any other non-``done`` verdict gets the ``continue`` guidance.
+    A broken judge fails open (logged) so it cannot permanently wedge work."""
+    verdict, reason = _goal_mode_handoff_rejection(task, evidence)
     if verdict == "done":
         return
     key = "blocked" if verdict == "blocked" else "continue"
