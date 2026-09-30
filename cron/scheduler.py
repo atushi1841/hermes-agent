@@ -1743,11 +1743,27 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
         return resolve_runtime_provider(**runtime_kwargs), model
     except Exception as resolve_exc:
         # Walk the fallback chain on AuthError AND transient network/DNS failures (e.g. during
-        # OAuth refresh); anything else re-raises.
+        # OAuth refresh) AND billing exhaustion (HTTP 400/402 credit insufficient); anything else
+        # re-raises. Billing was previously left to raise RuntimeError, so a free-tier provider
+        # running dry killed the job outright instead of rotating to the next configured provider
+        # (t_b10433f6: nightly-critic FAILED on freellmapi balance=10941 required=23444).
         is_auth = isinstance(resolve_exc, AuthError)
         is_transient_net = _is_transient_provider_resolve_error(resolve_exc)
         if not (is_auth or is_transient_net):
-            raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
+            from agent.error_classifier import classify_api_error, FailoverReason
+            try:
+                _classified = classify_api_error(resolve_exc)
+            except Exception:
+                _classified = None
+            is_billing = (
+                _classified is not None
+                and _classified.reason in (FailoverReason.billing, FailoverReason.auth_permanent)
+            )
+            if not is_billing:
+                raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
+            logger.warning(
+                "Job '%s': primary provider resolve failed (billing: %s), trying fallback",
+                job_id, resolve_exc)
 
         chain = _job_fallback_chain(job, jc.cfg) or []
         logger.warning(

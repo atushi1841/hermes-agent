@@ -142,6 +142,40 @@ def test_unpinned_job_still_walks_the_global_chain_at_resolve_time(tmp_path):
     assert (agent_kwargs["provider"], agent_kwargs["model"]) == ("openrouter", "z-ai/glm-5.2")
 
 
+class _BillingError(Exception):
+    """Mimics the HTTP 400 credit-insufficient body the freellmapi gateway returns."""
+
+
+def test_unpinned_job_walks_the_chain_on_billing_exhaustion(tmp_path):
+    """t_b10433f6: a free-tier provider running dry must rotate, not raise RuntimeError."""
+    err = _BillingError(
+        "HTTP 400: credit insufficient balance: balance=10941 required=23444")
+    success, error, requested, agent_kwargs = _run(tmp_path, _job(), primary_error=err)
+    assert (success, error) == (True, None)
+    assert requested == [None, "openrouter"]
+    assert (agent_kwargs["provider"], agent_kwargs["model"]) == ("openrouter", "z-ai/glm-5.2")
+
+
+def test_pinned_job_does_not_walk_the_chain_on_billing_exhaustion(tmp_path):
+    """A pinned job has no chain; billing exhaustion is its failure, not a rotation trigger."""
+    err = _BillingError("HTTP 400: credit insufficient balance: balance=0 required=1")
+    success, error, requested, agent_kwargs = _run(
+        tmp_path, _job(provider="anthropic", model="claude-sonnet-5"), primary_error=err)
+    assert success is False
+    assert "openrouter" not in requested
+    assert agent_kwargs == {}
+
+
+def test_unpinned_job_still_raises_on_unclassified_resolve_error(tmp_path):
+    """Anything the classifier does not tag billing/auth stays a hard failure."""
+    err = RuntimeError("something unexpected blew up")
+    success, error, requested, agent_kwargs = _run(tmp_path, _job(), primary_error=err)
+    assert success is False
+    assert "something unexpected blew up" in (error or "")
+    assert requested == [None]
+    assert agent_kwargs == {}
+
+
 def test_unpinned_job_agent_inherits_the_global_chain_mid_run(tmp_path):
     success, error, _requested, agent_kwargs = _run(tmp_path, _job())
     assert (success, error) == (True, None)
