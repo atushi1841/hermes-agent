@@ -26,7 +26,27 @@ _TERMINAL_KANBAN_TOOLS = frozenset({
     "kanban_request_changes",
 })
 
-_DEFAULT_MAX_ATTEMPTS = 2
+# Nudges before the loop gives up and the worker exits cleanly (rc=0) into a
+# protocol_violation. Measured 2026-09-29: workers run 3–57 min, then narrate a
+# completion instead of calling a terminal board tool; with a budget of 2 the
+# third exit is a guaranteed violation and the card burns a retry slot. 5 leaves
+# room for a weak fallback model to recover without materially extending the
+# turn (the loop still ends on max_turns). Override per-profile with
+# ``HERMES_KANBAN_STOP_MAX_NUDGES`` when a model needs a different ceiling.
+_DEFAULT_MAX_ATTEMPTS = 5
+
+
+def kanban_stop_max_attempts() -> int:
+    """Resolve the nudge budget: ``HERMES_KANBAN_STOP_MAX_NUDGES`` else the default."""
+    raw = (os.environ.get("HERMES_KANBAN_STOP_MAX_NUDGES") or "").strip()
+    if raw:
+        try:
+            val = int(raw)
+            if val > 0:
+                return val
+        except ValueError:
+            pass
+    return _DEFAULT_MAX_ATTEMPTS
 
 
 def kanban_stop_nudge_enabled() -> bool:
@@ -64,11 +84,13 @@ def build_kanban_stop_nudge(
     *,
     messages: Iterable[dict] | None = None,
     attempts: int = 0,
-    max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
+    max_attempts: Optional[int] = None,
     task_id: Optional[str] = None,
 ) -> Optional[str]:
     """Synthetic follow-up when a kanban worker exits without a terminal tool; ``None`` when
     the guard should not fire (not a kanban worker, already completed/blocked, budget exhausted)."""
+    if max_attempts is None:
+        max_attempts = kanban_stop_max_attempts()
     if (
         not kanban_stop_nudge_enabled()
         or attempts >= max_attempts
@@ -97,4 +119,9 @@ def build_kanban_stop_nudge(
     )
 
 
-__all__ = ["build_kanban_stop_nudge", "kanban_stop_nudge_enabled", "session_called_kanban_terminal"]
+__all__ = [
+    "build_kanban_stop_nudge",
+    "kanban_stop_max_attempts",
+    "kanban_stop_nudge_enabled",
+    "session_called_kanban_terminal",
+]
