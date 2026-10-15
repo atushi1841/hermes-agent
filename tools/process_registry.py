@@ -442,6 +442,20 @@ def restart_safe_gateway_child_argv(
         return GatewayChildDispatch("in_process", command)
     if not os.environ.get("INVOCATION_ID"):
         return GatewayChildDispatch("in_process", command)
+    # --- kensho-sweeps local patch (2026-10-01) ---
+    # WSL2: a cron job placed in a transient systemd scope
+    # (hermes-worker-cron-<job>-exec-<exec>.scope) exits silently a few seconds
+    # after start; the durable execution ends 'unknown' and nothing is delivered,
+    # while the same job run in-process completes normally (measured: one job,
+    # two paths, in-process=running vs scoped=dead in 5s). A cron job blocks its
+    # caller until it finishes, so in-process execution is correct here and is the
+    # documented WSL topology. Applies to the cron path only (outlives_parent is
+    # False for cron); fire-and-forget kanban workers keep its scope isolation.
+    # Enable with the systemd drop-in Environment=HERMES_CRON_NO_SCOPE=1.
+    # Revert by deleting this block and the drop-in.
+    if os.environ.get("HERMES_CRON_NO_SCOPE") == "1" and not outlives_parent:
+        return GatewayChildDispatch("in_process", command)
+    # --- end kensho-sweeps local patch ---
     supervised_gateway = _is_supervised_gateway_process()
     if not supervised_gateway and not outlives_parent:
         return GatewayChildDispatch("in_process", command)
